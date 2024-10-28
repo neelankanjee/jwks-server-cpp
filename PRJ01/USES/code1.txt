@@ -1,0 +1,457 @@
+#include <iostream>
+#include <string>
+#include <map>
+#include <ctime>
+#include <cassert> // For testing assertions
+#include <sqlite3.h> // Include SQLite library
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include "cpp-httplib-master/httplib.h"
+#include "jwt-cpp/jwt.h" // Include JWT-CPP library for JWT generation
+
+// Structure to store RSA key pair
+struct RSAKey {
+    std::string kid;
+    std::string publicKey;
+    std::string privateKey;
+    std::time_t expiresAt;
+};
+
+// Map to store keys with their kid
+std::map<std::string, RSAKey> keys;
+RSAKey expiredKey; // Store an expired key for "expired" token generation
+
+// SQLite Database
+sqlite3 *db;
+
+// Initialize SQLite Database and Create Table
+bool initDatabase() {
+    int rc = sqlite3_open("totally_not_my_privateKeys.db", &db);
+    if (rc != SQLITE_OK) {
+        std::cerr << "Cannot open database: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+
+    const char *sql = R"(
+        CREATE TABLE IF NOT EXISTS keys(
+            kid INTEGER PRIMARY KEY AUTOINCREMENT,
+            key BLOB NOT NULL,
+            exp INTEGER NOT NULL
+        );
+    )";
+
+    char *errMsg = nullptr;
+    rc = sqlite3_exec(db, sql, 0, 0, &errMsg);
+    if (rc != SQLITE_OK) {
+        std::cerr << "SQL error: " << errMsg << std::endl;
+        sqlite3_free(errMsg);
+        return false;
+    }
+    return true;
+}
+
+// Generate RSA key pair and store it in the database
+void generateKeyPair() {
+    RSA* rsa = RSA_new();
+    BIGNUM* e = BN_new();
+    BN_set_word(e, RSA_F4);
+    RSA_generate_key_ex(rsa, 2048, e, NULL);
+    BN_free(e);
+
+    BIO* pri = BIO_new(BIO_s_mem());
+    BIO* pub = BIO_new(BIO_s_mem());
+
+    PEM_write_bio_RSAPrivateKey(pri, rsa, NULL, NULL, 0, NULL, NULL);
+    PEM_write_bio_RSAPublicKey(pub, rsa);
+
+    size_t pri_len = BIO_pending(pri);
+    size_t pub_len = BIO_pending(pub);
+
+    char* pri_key = (char*)malloc(pri_len + 1);
+    char* pub_key = (char*)malloc(pub_len + 1);
+
+    BIO_read(pri, pri_key, pri_len);
+    BIO_read(pub, pub_key, pub_len);
+
+    pri_key[pri_len] = '\0';
+    pub_key[pub_len] = '\0';
+
+    std::string kid = "key_" + std::to_string(rand());
+    std::time_t expiry = std::time(0) + 3600;
+
+    const char* insertSQL = "INSERT INTO keys (key, exp) VALUES (?, ?);";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, pri_key, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, expiry);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "Error inserting key into database: " << sqlite3_errmsg(db) << std::endl;
+    }
+    sqlite3_finalize(stmt);
+
+    free(pri_key);
+    free(pub_key);
+    BIO_free_all(pub);
+    BIO_free_all(pri);
+    RSA_free(rsa);
+}
+
+// JWKS handler (Handles GET /jwks)
+void jwksHandler(const httplib::Request &req, httplib::Response &res) {
+    std::time_t now = std::time(0);
+    std::ostringstream jwks;
+    jwks << "{ \"keys\": [";
+
+    const char* selectSQL = "SELECT kid, key FROM keys WHERE exp > ?;";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, now);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::string kid = std::to_string(sqlite3_column_int(stmt, 0));
+        std::string publicKey = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        jwks << "{ \"kid\": \"" << kid << "\", \"publicKey\": \"" << publicKey << "\" },";
+    }
+
+    sqlite3_finalize(stmt);
+
+    std::string jwks_str = jwks.str();
+    if (jwks_str.back() == ',') {
+        jwks_str.pop_back();
+    }
+    jwks_str += "]}";
+    res.set_content(jwks_str, "application/json");
+}
+
+// Function to create a JWT
+std::string createJWT(const RSAKey& key, bool isExpired) {
+    auto token = jwt::create()
+        .set_issuer("jwks_server")
+        .set_type("JWT")
+        .set_issued_at(std::chrono::system_clock::now())
+        .set_expires_at(isExpired ? std::chrono::system_clock::now() - std::chrono::hours(1) : std::chrono::system_clock::now() + std::chrono::hours(1))
+        .set_payload_claim("kid", jwt::claim(std::string(key.kid)))
+        .sign(jwt::algorithm::rs256(key.publicKey, key.privateKey, "", ""));
+
+    return token;
+}
+
+// Auth handler (Handles POST /auth)
+void authHandler(const httplib::Request &req, httplib::Response &res) {
+    bool expired = req.has_param("expired");
+
+    const char* selectSQL = expired ?
+        "SELECT kid, key, exp FROM keys WHERE exp < ? ORDER BY exp DESC LIMIT 1;" :
+        "SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1;";
+
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, std::time(0));
+
+    std::string jwt;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::string kid = std::to_string(sqlite3_column_int(stmt, 0));
+        std::string privateKey = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        std::time_t exp = sqlite3_column_int64(stmt, 2);
+
+        RSAKey keyToUse = { kid, "", privateKey, exp };
+        jwt = createJWT(keyToUse, expired);
+    } else {
+        res.status = 404;
+        res.set_content("{\"error\":\"No appropriate key found\"}", "application/json");
+        sqlite3_finalize(stmt);
+        return;
+    }
+    sqlite3_finalize(stmt);
+
+    res.set_content("{\"token\":\"" + jwt + "\"}", "application/json");
+}
+
+// Cleanup expired keys from the database
+void cleanupExpiredKeys() {
+    const char* deleteSQL = "DELETE FROM keys WHERE exp < ?;";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, deleteSQL, -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, std::time(0));
+
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        std::cerr << "Error deleting expired keys: " << sqlite3_errmsg(db) << std::endl;
+    }
+    sqlite3_finalize(stmt);
+}
+
+// Basic test function
+void runTests() {
+    // Ensure the database initializes properly
+    assert(initDatabase());
+
+    // Generate a key and check that it inserts correctly
+    generateKeyPair();
+    std::cout << "Key generation test passed." << std::endl;
+
+    // Test the JWKS endpoint
+    httplib::Client client("http://localhost:8080");
+    auto jwks_res = client.Get("/jwks");
+    assert(jwks_res && jwks_res->status == 200);
+    std::cout << "JWKS endpoint test passed." << std::endl;
+
+    // Test the /auth endpoint
+    auto auth_res = client.Post("/auth");
+    assert(auth_res && auth_res->status == 200);
+    std::cout << "Auth endpoint test passed." << std::endl;
+
+    // Cleanup expired keys
+    cleanupExpiredKeys();
+    std::cout << "Expired key cleanup test passed." << std::endl;
+}
+
+int main() {
+    if (!initDatabase()) {
+        std::cerr << "Failed to initialize the database." << std::endl;
+        return 1;
+    }
+
+    generateKeyPair();
+
+    httplib::Server svr;
+    svr.Get("/jwks", jwksHandler);
+    svr.Post("/auth", authHandler);
+
+    std::cout << "Server is running on http://localhost:8080" << std::endl;
+
+    std::thread testThread(runTests); // Run tests in a separate thread
+    testThread.join(); // Wait for tests to complete
+
+    svr.listen("0.0.0.0", 8080);
+    sqlite3_close(db);
+
+    return 0;
+}
+
+
+
+
+
+//original:
+
+#include <iostream>
+#include <string>
+#include <map>
+#include <ctime>
+#include <cassert>
+#include <sqlite3.h>
+#include <openssl/rsa.h>
+#include <openssl/pem.h>
+#include <openssl/bio.h>
+#include <openssl/evp.h>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
+#include "cpp-httplib-master/httplib.h"
+#include "jwt-cpp/jwt.h"
+#include <thread>
+#include <chrono>
+
+struct RSAKey {
+    std::string kid;
+    std::string publicKey;
+    std::string privateKey;
+    std::time_t expiresAt;
+};
+
+std::map<std::string, RSAKey> keys;
+sqlite3 *db;
+
+bool initDatabase() {
+    int rc = sqlite3_open("totally_not_my_privateKeys.db", &db);
+    if (rc != SQLITE_OK) {
+        std::cerr << "Cannot open database: " << sqlite3_errmsg(db) << std::endl;
+        return false;
+    }
+    std::cout << "Database opened successfully." << std::endl;
+
+    const char *sql = R"(
+        CREATE TABLE IF NOT EXISTS keys(
+            kid INTEGER PRIMARY KEY AUTOINCREMENT,
+            key BLOB NOT NULL,
+            exp INTEGER NOT NULL
+        );
+    )";
+    char *errMsg = nullptr;
+    rc = sqlite3_exec(db, sql, 0, 0, &errMsg);
+    if (rc != SQLITE_OK) {
+        std::cerr << "SQL error: " << errMsg << std::endl;
+        sqlite3_free(errMsg);
+        return false;
+    }
+    std::cout << "Table 'keys' created or already exists." << std::endl;
+    return true;
+}
+
+void generateKeyPair() {
+    EVP_PKEY *pkey = nullptr;
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, nullptr);
+    EVP_PKEY_keygen_init(ctx);
+    EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, 2048);
+    EVP_PKEY_keygen(ctx, &pkey);
+    EVP_PKEY_CTX_free(ctx);
+
+    BIO *pri = BIO_new(BIO_s_mem());
+    BIO *pub = BIO_new(BIO_s_mem());
+    PEM_write_bio_PrivateKey(pri, pkey, nullptr, nullptr, 0, nullptr, nullptr);
+    PEM_write_bio_PUBKEY(pub, pkey);
+
+    size_t pri_len = BIO_pending(pri);
+    size_t pub_len = BIO_pending(pub);
+    char *pri_key = (char *)malloc(pri_len + 1);
+    char *pub_key = (char *)malloc(pub_len + 1);
+
+    BIO_read(pri, pri_key, pri_len);
+    BIO_read(pub, pub_key, pub_len);
+    pri_key[pri_len] = '\0';
+    pub_key[pub_len] = '\0';
+
+    std::string kid = "key_" + std::to_string(rand());
+    std::time_t expiry = std::time(0) + 3600;
+
+    const char* insertSQL = "INSERT INTO keys (key, exp) VALUES (?, ?);";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nullptr);
+    sqlite3_bind_text(stmt, 1, pri_key, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 2, expiry);
+
+    int rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        std::cerr << "Error inserting key into database: " << sqlite3_errmsg(db) << std::endl;
+    }
+    sqlite3_finalize(stmt);
+
+    free(pri_key);
+    free(pub_key);
+    BIO_free_all(pub);
+    BIO_free_all(pri);
+    EVP_PKEY_free(pkey);
+}
+
+void jwksHandler(const httplib::Request &req, httplib::Response &res) {
+    std::time_t now = std::time(0);
+    std::ostringstream jwks;
+    jwks << "{ \"keys\": [";
+
+    const char* selectSQL = "SELECT kid, key FROM keys WHERE exp > ?;";
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, now);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::string kid = std::to_string(sqlite3_column_int(stmt, 0));
+        std::string publicKey = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        jwks << "{ \"kid\": \"" << kid << "\", \"publicKey\": \"" << publicKey << "\" },";
+    }
+
+    sqlite3_finalize(stmt);
+
+    std::string jwks_str = jwks.str();
+    if (jwks_str.back() == ',') {
+        jwks_str.pop_back();
+    }
+    jwks_str += "]}";
+    res.set_content(jwks_str, "application/json");
+}
+
+void authHandler(const httplib::Request &req, httplib::Response &res) {
+    bool expired = req.has_param("expired");
+
+    const char* selectSQL = expired ?
+        "SELECT kid, key, exp FROM keys WHERE exp < ? ORDER BY exp DESC LIMIT 1;" :
+        "SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp ASC LIMIT 1;";
+
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, selectSQL, -1, &stmt, nullptr);
+    sqlite3_bind_int64(stmt, 1, std::time(0));
+
+    std::string jwt;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        std::string kid = std::to_string(sqlite3_column_int(stmt, 0));
+        std::string privateKey = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        std::time_t exp = sqlite3_column_int64(stmt, 2);
+
+        RSAKey keyToUse = { kid, "", privateKey, exp };
+        auto token = jwt::create()
+            .set_issuer("jwks_server")
+            .set_type("JWT")
+            .set_issued_at(std::chrono::system_clock::now())
+            .set_expires_at(expired ? std::chrono::system_clock::now() - std::chrono::hours(1) : std::chrono::system_clock::now() + std::chrono::hours(1))
+            .set_payload_claim("kid", jwt::claim(std::string(keyToUse.kid)))
+            .sign(jwt::algorithm::rs256(keyToUse.publicKey, keyToUse.privateKey, "", ""));
+        
+        jwt = token;
+    } else {
+        res.status = 404;
+        res.set_content("{\"error\":\"No appropriate key found\"}", "application/json");
+        sqlite3_finalize(stmt);
+        return;
+    }
+    sqlite3_finalize(stmt);
+    res.set_content("{\"token\":\"" + jwt + "\"}", "application/json");
+}
+
+// Function with retries for connecting to /jwks endpoint
+void runTests() {
+    httplib::Client client("http://localhost:8080");
+    int retries = 5;
+    int wait_time_ms = 500; // initial wait time between retries
+
+    for (int i = 0; i < retries; ++i) {
+        auto jwks_res = client.Get("/jwks");
+        if (jwks_res && jwks_res->status == 200) {
+            std::cout << "JWKS endpoint test passed." << std::endl;
+            break;
+        } else {
+            std::cerr << "Attempt " << (i + 1) << " to reach /jwks endpoint failed. Retrying..." << std::endl;
+            std::this_thread::sleep_for(std::chrono::milliseconds(wait_time_ms));
+            wait_time_ms *= 2; // Exponential backoff
+            if (i == retries - 1) {
+                std::cerr << "Failed to reach /jwks endpoint after " << retries << " attempts." << std::endl;
+                assert(jwks_res && jwks_res->status == 200); // assert to maintain existing behavior
+            }
+        }
+    }
+
+    auto auth_res = client.Post("/auth");
+    if (auth_res && auth_res->status == 200) {
+        std::cout << "Auth endpoint test passed." << std::endl;
+    } else {
+        std::cerr << "Failed to reach /auth endpoint. Status: "
+                  << (auth_res ? std::to_string(auth_res->status) : "No response")
+                  << std::endl;
+        std::cerr << "Response body: " << (auth_res ? auth_res->body : "No body") << std::endl;
+        assert(auth_res && auth_res->status == 200);
+    }
+}
+
+int main() {
+    if (!initDatabase()) {
+        std::cerr << "Failed to initialize the database." << std::endl;
+        return 1;
+    }
+
+    generateKeyPair();
+
+    httplib::Server svr;
+    svr.Get("/jwks", jwksHandler);
+    svr.Post("/auth", authHandler);
+
+    std::cout << "Server is running on http://localhost:8080" << std::endl;
+
+    std::thread testThread(runTests); // Run tests with retries in a separate thread
+    testThread.join();
+
+    svr.listen("0.0.0.0", 8080);
+    sqlite3_close(db);
+
+    return 0;
+}
